@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app.auth.identity import reset_current_claims, set_current_claims
-from app.mcp import tools
+from app.services import desk_tools as tools
 from app.models.tradelocker import (
     TradeLockerAccountIdentity,
     TradeLockerAccountStatus,

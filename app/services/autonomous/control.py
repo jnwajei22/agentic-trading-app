@@ -45,7 +45,7 @@ def strategy_default_times(profile: dict[str, Any]) -> list[str]:
     return [f"{hour:02d}:00" for hour in sorted(hours)]
 
 
-class ChatGPTAutonomyService:
+class AutonomyControlService:
     def __init__(self, *, brokers: BrokerRepository | None = None,
                  execution: ExecutionRepository | None = None,
                  schedules: ScheduleRepository | None = None,
@@ -178,7 +178,7 @@ class ChatGPTAutonomyService:
         changes = {f"{environment}_autonomous_enabled": True}
         if environment == "demo": changes["global_autonomous_kill_switch"] = False
         controls = self.execution.update_autonomous_controls(user_sub, changes,
-            updated_by=user_sub, source="mcp", reason=f"ChatGPT started {environment} autonomous trading",
+            updated_by=user_sub, source="assistant", reason=f"Desk started {environment} autonomous trading",
             audit_unchanged=True)
         if not controls[f"{environment}_autonomous_enabled"] or (environment == "demo" and controls["global_autonomous_kill_switch"]):
             raise AutonomousControlError("autonomous_control_persistence_failed",
@@ -186,9 +186,9 @@ class ChatGPTAutonomyService:
         immediate = None
         if run_now:
             seed = f"{user_sub}:{profile['public_id']}:{environment}:{controls['updated_at']}"
-            run_key = f"chatgpt-start:{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
+            run_key = f"desk-start:{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
             result = await dispatch_autonomous_cycle(self.runner_factory(), user_sub, profile["public_id"], run_key,
-                "chatgpt:start_autonomous_trading")
+                "desk:start_autonomous_trading")
             immediate = {"run_id": result.get("run_id"), "status": result.get("status"),
                 "blocking_reasons": result.get("reason_codes") or [], "duplicate": bool(result.get("duplicate"))}
         blocked_run = bool(immediate and immediate["status"] in {"blocked", "skipped", "error"})
@@ -202,8 +202,8 @@ class ChatGPTAutonomyService:
     def stop(self, user_sub: str, environment: Environment, *, account_alias: str | None = None) -> dict[str, Any]:
         account = self._account(user_sub, environment, account_alias)
         controls = self.execution.update_autonomous_controls(user_sub,
-            {f"{environment}_autonomous_enabled": False}, updated_by=user_sub, source="mcp",
-            reason=f"ChatGPT stopped {environment} autonomous trading", audit_unchanged=True)
+            {f"{environment}_autonomous_enabled": False}, updated_by=user_sub, source="assistant",
+            reason=f"Desk stopped {environment} autonomous trading", audit_unchanged=True)
         return {"status": "stopped", "environment": environment,
             "account_alias": account["account_alias"], "autonomous_enabled": False,
             "global_kill_switch": controls["global_autonomous_kill_switch"],
@@ -215,7 +215,7 @@ class ChatGPTAutonomyService:
         if not reason.strip():
             raise AutonomousControlError("reason_required", "A reason is required for an emergency stop.")
         controls = self.execution.update_autonomous_controls(user_sub,
-            {"global_autonomous_kill_switch": True}, updated_by=user_sub, source="mcp",
+            {"global_autonomous_kill_switch": True}, updated_by=user_sub, source="assistant",
             reason=reason.strip(), audit_unchanged=True)
         return {"status": "stopped", "global_kill_switch": controls["global_autonomous_kill_switch"],
             "demo_autonomous_enabled": controls["demo_autonomous_enabled"],

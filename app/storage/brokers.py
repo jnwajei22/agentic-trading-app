@@ -430,7 +430,7 @@ class BrokerRepository:
             elif profile is not None:
                 join=" JOIN execution_profiles p ON p.broker_account_id=a.id"; condition="(p.public_id=? OR p.name=? COLLATE NOCASE)"; params.extend([profile,profile])
             profile_columns = "p.public_id profile_ref,p.enabled profile_enabled,p.execution_mode profile_execution_mode" if profile is not None else "NULL profile_ref,1 profile_enabled,NULL profile_execution_mode"
-            return db.execute(f"""SELECT a.*,b.public_id connection_ref,b.base_url,b.username,b.password_encrypted,b.server,b.status connection_status,
+            return db.execute(f"""SELECT a.*,b.public_id connection_ref,b.base_url,b.username,b.password_encrypted,b.encryption_key_version,b.server,b.status connection_status,
                 b.broker_name,b.label connection_label,{profile_columns}
                 FROM broker_accounts a JOIN users u ON u.id=a.user_id JOIN broker_connections b ON b.id=a.connection_id {join}
                 WHERE u.auth0_sub=? AND {condition} LIMIT 1""",params).fetchone()
@@ -586,8 +586,8 @@ class BrokerRepository:
         if row is None:
             return None
         try:
-            password = self._fernet().decrypt(row["password_encrypted"]).decode()
-        except InvalidToken as exc:
+            password = self._cipher().decrypt(row["password_encrypted"], row["encryption_key_version"])
+        except (InvalidToken, SecretDecryptionError) as exc:
             raise BrokerStorageError("Stored broker credentials cannot be decrypted.") from exc
         return {"base_url": row["base_url"], "username": row["username"], "password": password,
             "server": row["server"], "account_id": str(row["broker_account_id"]), "account_number": str(row["acc_num"]),

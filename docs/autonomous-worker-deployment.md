@@ -1,6 +1,5 @@
 # Persistent autonomous worker
 
-Autonomous schedules are durable database records. They must be polled by one or more persistent worker services; an MCP request must never launch a temporary scheduler subprocess.
 
 ## Local development
 
@@ -32,6 +31,3 @@ AUTONOMOUS_DECISION_PROVIDER=openai
 AUTONOMOUS_DECISION_MODEL=<approved model identifier>
 OPENAI_API_KEY=<server secret>
 ```
-
-Do not place these settings in execution profiles or expose them through MCP/frontend responses. Health is available at `/scheduler/health`, `/api/autonomous-worker-health`, and `get_autonomous_trading_status`.
-

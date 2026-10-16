@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.auth.identity import reset_current_claims, set_current_claims
-from app.mcp import tools
+from app.services import desk_tools as tools
 from app.models.providers import MarketCandle, MarketSeries
 from app.services.market_data.series_cache import market_series_cache
 
@@ -39,21 +39,21 @@ async def render(owner: str, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_render_passes_full_candles_only_in_meta_and_preserves_incomplete_metadata():
+async def test_native_chart_payload_preserves_incomplete_metadata():
     entry = market_series_cache.put("user-a", series(complete=False))
     result = await render("user-a", series_id=entry.series_id)
-    assert result.structured_content["status"] == "ready"
-    assert "candles" not in result.structured_content
-    assert len(result.meta["chart"]["candles"]) == 2
-    assert result.meta["chart"]["complete"] is False
-    assert result.meta["chart"]["warning"] == "partial"
+    assert result["status"] == "ready"
+    assert "candles" not in result
+    assert len(result["chart"]["candles"]) == 2
+    assert result["chart"]["complete"] is False
+    assert result["chart"]["warning"] == "partial"
 
 
 @pytest.mark.asyncio
 async def test_other_user_receives_access_denied():
     entry = market_series_cache.put("user-a", series())
     result = await render("user-b", series_id=entry.series_id)
-    assert result.structured_content["error"] == "series_access_denied"
+    assert result["error"] == "series_access_denied"
 
 
 @pytest.mark.asyncio
@@ -68,22 +68,22 @@ async def test_other_user_receives_access_denied():
 async def test_malformed_annotations_are_normalized(arguments, error):
     entry = market_series_cache.put("user-a", series())
     result = await render("user-a", series_id=entry.series_id, **arguments)
-    assert result.is_error and result.structured_content["error"] == error
-    assert result.structured_content["details"]
+    assert result["status"] == "error" and result["error"] == error
+    assert result["details"]
 
 
 @pytest.mark.asyncio
 async def test_empty_payload_is_normalized():
     entry = market_series_cache.put("user-a", series(candles=False))
     result = await render("user-a", series_id=entry.series_id)
-    assert result.structured_content["error"] == "chart_payload_empty"
+    assert result["error"] == "chart_payload_empty"
 
 
 @pytest.mark.asyncio
 async def test_expired_series_is_normalized(monkeypatch):
     monkeypatch.setattr(market_series_cache, "get", lambda owner, key: ("expired", None))
     result = await render("user-a", series_id="abcdefghijklmnop")
-    assert result.structured_content["error"] == "series_expired"
+    assert result["error"] == "series_expired"
 
 
 @pytest.mark.asyncio

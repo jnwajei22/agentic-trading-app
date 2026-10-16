@@ -4,7 +4,6 @@ This workflow performs consequential broker-side writes only against the authent
 
 ## Safety architecture
 
-Execution settings are keyed by authenticated user, connection, account ID, and account number. New account records default to `read_only`; `demo_manual` and `demo_autonomous` can be selected only through the authenticated settings API/UI. MCP tools cannot change this setting. The existing MCP kill-switch operation remains one-way: it can enable the switch but cannot disable it.
 
 Every snapshot, preview, and submission resolves the profile-bound connection internally. Demo execution requires all of the following to agree:
 
@@ -16,9 +15,7 @@ Every snapshot, preview, and submission resolves the profile-bound connection in
 
 The submit tool accepts only `preview_id` and `idempotency_key`. It cannot accept an account, environment, URL, instrument, side, price, quantity, stop, or target. Market and limit orders include absolute stop-loss and take-profit fields in the initial TradeLocker order request.
 
-OAuth additionally requires `forex:execute` for submission; read or preview permission alone cannot call the broker-write tool.
 
-## MCP workflow
 
 1. `get_autonomous_demo_status` checks readiness without mutation.
 2. `get_autonomous_demo_snapshot` stores an immutable, short-lived normalized account/market/provider snapshot.
@@ -79,7 +76,6 @@ Do not perform this procedure on a live account.
 9. Retrieve the run result and independently inspect the TradeLocker order/position.
 10. Confirm side, lot quantity, stop loss, and take profit.
 11. Retry the same preview/key and confirm no second broker order exists.
-12. Enable the MCP kill switch and confirm another preview/submission is blocked.
 13. Confirm no live account was modified.
 
 ## Current limitations

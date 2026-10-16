@@ -10,7 +10,7 @@ from app.brokers.tradelocker import adapter
 from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.main import app
-from app.mcp import tools
+from app.services import desk_tools as tools
 from app.storage.brokers import BrokerRepository
 from app.services.tradelocker.config_cache import (
     TradeLockerConfigCacheKey,
@@ -683,7 +683,6 @@ def test_cors_allows_configured_frontend_origin():
 @pytest.mark.asyncio
 async def test_mcp_missing_connection_returns_safe_setup_url(platform_storage, monkeypatch):
     monkeypatch.setattr(settings, "frontend_origin", "https://setup.example.test/")
-    monkeypatch.setattr(settings, "chatgpt_return_url", "https://chatgpt.com")
     identity_token = set_current_claims(_claims("auth0|not-connected"))
     try:
         result = await tools.get_my_tradelocker_symbols()
@@ -692,8 +691,7 @@ async def test_mcp_missing_connection_returns_safe_setup_url(platform_storage, m
         reset_current_claims(identity_token)
 
     expected_url = (
-        "https://setup.example.test/connect-tradelocker?source=chatgpt"
-        "&returnTo=https%3A%2F%2Fchatgpt.com"
+        "https://setup.example.test/connect-tradelocker"
     )
     assert result == {
         "status": "setup_required",
@@ -701,7 +699,7 @@ async def test_mcp_missing_connection_returns_safe_setup_url(platform_storage, m
         "setup_url": expected_url,
         "instruction": (
             "Open the setup URL, connect TradeLocker using the same login account, "
-            "then return to ChatGPT and run this again."
+            "then retry in the desk assistant."
         ),
     }
     assert status["setup_url"] == expected_url

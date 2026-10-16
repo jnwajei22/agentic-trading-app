@@ -1,6 +1,5 @@
 # TradeLocker multi-account model
 
-Agentic Forex Desk stores every TradeLocker connection and every account discovered through it. Credentials remain encrypted at rest. Broker account IDs are internal routing data; authenticated APIs and MCP account selection use durable public IDs and case-insensitive account aliases.
 
 ## Resolution rules
 
@@ -28,7 +27,6 @@ Connections carry a discovery version and one-time refresh marker. Migrated conn
 
 On first startup, the former one-connection schema is migrated in place. Its encrypted credential value is copied without decryption or reconnection, the selected account becomes the default analysis account, the `hourly_forex_v1` strategy template is seeded, and a read-only execution profile is created for the migrated selection.
 
-## MCP selectors
 
 The safe account-facing tools are:
 
@@ -45,7 +43,6 @@ The demo execution tools require an execution-profile reference for status, snap
 
 ## Demo Manual execution
 
-Only an enabled, owned `demo_manual` profile bound to a verified demo account may create new entry previews or submissions. The public MCP workflow is:
 
 - `get_demo_execution_status(profile_id)`
 - `get_demo_trading_snapshot(profile_id, symbol)`
@@ -60,5 +57,3 @@ Entry submission never accepts quantity or broker routing fields. The backend de
 Snapshots and previews expire after 60 seconds. Entry previews include mandatory stop loss and take profit. The entry request sends both protections atomically and reconciliation verifies quantity, side, stop, and target. If a filled position is found without both protections, the service records `protection_failure`, attempts a full emergency close, and verifies whether the account is flat.
 
 Cancellation uses TradeLocker's documented `DELETE /trade/orders/{orderId}` operation. Full-position close uses `DELETE /trade/positions/{positionId}` with `qty: 0`. Both require an immutable preview, use durable user-scoped idempotency, reload their profile route, and reconcile by confirming that the target disappeared. Ambiguous write responses are recorded as `unknown` and are never blindly retried.
-
-The kill switch blocks new entry snapshots, previews, and submissions. Risk-reducing cancel and close actions remain independently validated and available. MCP can enable the switch but cannot disable it.

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app.models.market import Candle
-from app.mcp import tools
+from app.services import desk_tools as tools
 from app.services.market_data.candles import normalize_candle, normalize_history_payload
 from app.services.market_data.history import (
     MAX_CANDLES,
