@@ -87,7 +87,7 @@ class BrokerAccountResolver:
         if require_available and (not row["available"] or not row["broker_active"]):
             raise AccountResolutionError("account_unavailable", "The selected TradeLocker account is unavailable.")
         try:
-            password = self.repository._fernet().decrypt(row["password_encrypted"]).decode()
+            password = self.repository._cipher().decrypt(row["password_encrypted"], row["encryption_key_version"])
         except Exception as exc:
             raise AccountResolutionError("broker_storage_error", "Stored broker credentials cannot be decrypted.") from exc
         context = BrokerAccountContext(

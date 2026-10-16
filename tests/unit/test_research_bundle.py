@@ -1,6 +1,6 @@
 import pytest
 
-from app.mcp import tools
+from app.services import desk_tools as tools
 
 
 @pytest.mark.asyncio

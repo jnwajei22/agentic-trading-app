@@ -6,24 +6,14 @@ class Settings(BaseSettings):
     app_timezone: str = "America/Chicago"
     public_base_url: str = "https://mcp.justinnwajei.com"
     frontend_origin: str = "https://app.agenticforexdesk.com"
-    chatgpt_return_url: str = "https://chatgpt.com"
-    oauth_authorization_url: str | None = None
-    oauth_token_url: str | None = None
-    oauth_transaction_secret: str | None = None
-    oauth_allowed_client_ids: str | None = None
-    oauth_access_token_ttl_seconds: int = Field(default=3600, gt=0)
-    oauth_refresh_token_ttl_seconds: int = Field(default=7776000, gt=0)
-    onboarding_assertion_secret: str | None = None
-    onboarding_assertion_issuers: str | None = None
     sqlite_path: str = "storage/app.db"
     broker_secret_key: str | None = None
+    broker_secret_keys_json: str = "{}"
+    active_encryption_key_version: str = "v1"
     allow_env_broker_fallback: bool = False
 
     database_url: str | None = None
     tradingview_webhook_secret: str | None = None
-    mcp_shared_secret: str | None = None
-    mcp_allow_public_no_auth: bool = False
-    mcp_require_oauth: bool = True
     auth_issuer: str | None = None
     auth_audience: str | None = None
     auth_jwks_url: str | None = None
@@ -74,6 +64,7 @@ class Settings(BaseSettings):
     autonomous_maximum_upstream_requests_per_run: int = Field(default=40,ge=1,le=500)
     autonomous_maximum_run_duration_seconds: float = Field(default=45,gt=0,le=300)
     autonomous_max_arming_hours: int = 24
+    agent_model: str | None = None
     openai_api_key: str | None = Field(default=None, repr=False)
     autonomous_scheduler_poll_seconds: float = Field(default=30,gt=0)
     autonomous_scheduler_lease_seconds: int = Field(default=180,ge=30)

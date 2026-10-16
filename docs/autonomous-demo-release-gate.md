@@ -18,7 +18,6 @@ The readiness command opens SQLite in read-only/query-only mode and performs bro
 3. Install locked backend and frontend dependencies.
 4. Apply the ordered application migrations, inspect their output, and retain the backup until verification is complete.
 5. Restart the API and the dedicated scheduler/worker; confirm both use the same database and configuration.
-6. Reconnect or refresh the ChatGPT app so the new protected tools appear.
 7. Reauthenticate TradeLocker only if its connection check says authentication is required.
 8. Verify every stored account, connection, server, environment classification, safe reference, and unique alias.
 9. Confirm every live or unknown account profile is `read_only` (or disabled), never demo-enabled.
@@ -48,5 +47,3 @@ The readiness command opens SQLite in read-only/query-only mode and performs bro
 Never use rollback as permission to act on a live or unknown account.
 
 ## Automated release matrix
-
-The full suite includes routing and tenant isolation (`test_multi_account_storage.py`), manual risk-reducing actions (`test_demo_actions.py`), atomic protected broker writes (`test_tradelocker_client.py` and `test_autonomous_execution.py`), decision persistence (`test_autonomous_decision_runner.py`), durable worker locking and timing (`test_autonomous_scheduler.py`), MCP authorization (`test_mcp_server.py`), and the operational safety regressions under `tests/release_gate`. The secret regression is `python -m scripts.secret_leak_gate` and must also pass after the frontend production build.

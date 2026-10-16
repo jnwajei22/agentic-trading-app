@@ -5,7 +5,7 @@ import uuid
 
 import anyio
 import jwt
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
@@ -24,10 +24,16 @@ from app.services.autonomous.decision import decision_provider_readiness
 from app.jobs.autonomous_scheduler import AutonomousScheduleService
 from app.storage.schedules import ScheduleRepository, ScheduleStorageError
 from app.storage.execution import ExecutionRepository
+from app.storage.user_experience import UserExperienceRepository
+from app.storage.runtime_settings import RuntimeSettingsRepository
 from app.auth.identity import normalize_auth0_subject
 from app.services.tradelocker.config_cache import tradelocker_config_cache
 from app.models.execution_profile_v2 import CapitalAllocationPatch, ExecutionProfileV2
 from app.services.trading_policy import MARKET_GROUPS, normalize_instrument, resolve_universe
+from app.services.market_workspace import MarketWorkspaceService
+from app.services.trading.order_calculations import calculate_order, forex_terms
+from app.providers.registry import provider_registry
+from app.services.instruments import InstrumentMappingError, instrument_mapper
 
 
 router = APIRouter(prefix="/api", tags=["platform"])
@@ -54,6 +60,26 @@ class AccountSelection(BaseModel):
         validation_alias=AliasChoices("account_number", "accountNumber", "accNum")
     )
     connection_id: str | None = Field(default=None, validation_alias=AliasChoices("connection_id", "connectionId"))
+
+
+class CalculationValue(BaseModel):
+    mode: Literal["price", "pips", "reward_multiple", "rr"]
+    value: float = Field(gt=0)
+
+
+class CalculationQuantity(BaseModel):
+    value: float = Field(gt=0)
+    unit: Literal["lot", "share", "contract", "fractional_share"] = "lot"
+
+
+class OrderCalculationRequest(BaseModel):
+    account_id: str
+    instrument_id: str
+    side: Literal["buy", "sell"]
+    order_type: Literal["market", "limit", "stop"] = "market"
+    quantity: CalculationQuantity
+    stop_loss: CalculationValue | None = None
+    take_profit: CalculationValue | None = None
 
 
 class AccountAliasUpdate(BaseModel):
@@ -89,12 +115,18 @@ class ExecutionProfileUpdate(BaseModel):
 class ExecutionProfileV2Patch(BaseModel):
     model_config=ConfigDict(extra="forbid")
     schema_version: Literal[2] | None = None
+    asset_class:Literal["forex","equities","options"]|None=None
+    trading_account:str|None=None
     trading_policy: dict[str, Any] | None = None
     market_universe: dict[str, Any] | None = None
     risk_policy: dict[str, Any] | None = None
     capital_allocation: CapitalAllocationPatch | None = None
     exit_policy: dict[str, Any] | None = None
     schedule_policy: dict[str, Any] | None = None
+    provider_capability_requirements:list[str]|None=None
+    forex:dict[str,Any]|None=None
+    equities:dict[str,Any]|None=None
+    options:dict[str,Any]|None=None
     enabled: bool | None = None
 
 
@@ -122,16 +154,43 @@ class AutonomousArmRequest(BaseModel):
 class AutonomousScheduleRequest(BaseModel):
     model_config=ConfigDict(extra="forbid")
     timezone: str = Field(default="America/Chicago",min_length=1,max_length=80)
-    local_times: list[str] = Field(default_factory=lambda:["05:00","07:00","09:00","11:00","13:15"],min_length=1,max_length=24)
+    local_times: list[str] | None = Field(default=None,min_length=1,max_length=24)
+    recurrence: dict[str,Any] | None = None
     enabled: bool = True
     maximum_lateness_seconds: int = Field(default=600,ge=30,le=3600)
+
+
+class UserPreferencesUpdate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    appearance:Literal["light","dark","system"]|None=None
+    timezone:str|None=Field(default=None,min_length=1,max_length=80)
+    date_format:Literal["locale","month_day_year","day_month_year","year_month_day"]|None=None
+    time_format:Literal["locale","12_hour","24_hour"]|None=None
+    currency_display:Literal["account","usd"]|None=None
+    notifications:dict[str,bool]|None=None
+
+
+class WatchlistCreate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    name:str=Field(min_length=1,max_length=60)
+    symbols:list[str]=Field(default_factory=list,max_length=100)
+
+
+class WatchlistUpdate(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    name:str|None=Field(default=None,min_length=1,max_length=60)
+    items:list[dict[str,Any]]=Field(default_factory=list,max_length=100)
+
+
+class AccountNicknameUpdate(BaseModel):
+    nickname:str|None=Field(default=None,max_length=64)
 
 
 async def current_claims(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     scheme, separator, token = (authorization or "").partition(" ")
     if not separator or scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="OAuth access token is required.")
-    from app.mcp.auth import _verify_access_token
+    from app.auth.tokens import _verify_access_token
 
     try:
         claims = await anyio.to_thread.run_sync(_verify_access_token, token)
@@ -177,6 +236,8 @@ def _profile_contract(profile: dict[str, Any], instruments: list[dict[str, Any]]
     warnings = ([{"code":"legacy_profile_projected","message":"This legacy profile is projected into V2 and will be persisted on its next PATCH."}]
         if migration != "native_v2" else [])
     return {"profile_id":profile["public_id"], "account_id":profile["account_id"], "account_alias":profile["account_alias"],
+        "account_number":profile.get("account_number"),"broker_name":profile.get("broker_name"),
+        "account_environment":profile.get("account_environment"),"nickname":profile.get("nickname"),
         "profile":profile["profile_v2"], "supported_enum_options":_capabilities(profile, instruments),
         "server_defaults":ExecutionProfileV2().model_dump(mode="json"),
         "field_validation_ranges":{"minimum_confidence":{"minimum":0,"maximum":1},"risk_pct_per_trade":{"exclusive_minimum":0,"maximum":1},
@@ -205,6 +266,296 @@ async def _account_instruments(user_sub: str, account_alias: str) -> tuple[dict[
 async def me(claims: dict = Depends(current_claims)) -> dict:
     repository().ensure_user(claims["sub"], claims.get("email"))
     return {"sub": claims["sub"], "email": claims.get("email")}
+
+
+@router.get("/providers")
+async def providers(claims:dict=Depends(current_claims))->dict:
+    enabled=set(RuntimeSettingsRepository().get_all()["enabled_providers"])
+    rows=[]
+    for provider in provider_registry.all():
+        item=provider.public()
+        if provider.status=="available" and provider.provider_type not in enabled:item["status"]="disabled"
+        rows.append(item)
+    return {"providers":rows}
+
+
+@router.get("/providers/{provider_type}/capabilities")
+async def provider_capabilities(provider_type:str,claims:dict=Depends(current_claims))->dict:
+    provider=provider_registry.get(provider_type)
+    if not provider:raise HTTPException(status_code=404,detail="Provider not found.")
+    return {"provider_type":provider_type,"status":provider.status,
+        "execution_provider":provider.execution_provider,"capabilities":provider.capabilities.public()}
+
+
+@router.get("/trading/connections")
+async def trading_connections(claims:dict=Depends(current_claims))->dict:
+    rows=[]
+    for item in repository().list_connections(claims["sub"]):
+        rows.append({**item,"provider_type":"tradelocker","authentication_type":"credentials",
+            "display_name":item.get("label") or item.get("broker_name"),"roles":["execution","account_data","broker_market_data"]})
+    return {"connections":rows}
+
+
+@router.post("/trading/connections/{provider_type}")
+async def create_trading_connection(provider_type:str,claims:dict=Depends(current_claims))->dict:
+    provider=provider_registry.get(provider_type)
+    if not provider:raise HTTPException(status_code=404,detail="Provider not found.")
+    if provider_type!="tradelocker":raise HTTPException(status_code=501,detail=f"{provider.display_name} is {provider.status}.")
+    return {"provider_type":"tradelocker","status":"credentials_required","connection_url":"/connect-tradelocker?new=1"}
+
+
+@router.delete("/trading/connections/{connection_id}")
+async def delete_trading_connection(connection_id:str,claims:dict=Depends(current_claims))->dict:
+    try:
+        if not repository().remove_connection(claims["sub"],connection_id):raise HTTPException(status_code=404,detail="Connection not found.")
+    except BrokerStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
+    return {"status":"deleted","connection_id":connection_id}
+
+
+@router.get("/trading/accounts")
+async def trading_accounts(claims:dict=Depends(current_claims))->dict:
+    capabilities=provider_registry.require("tradelocker").capabilities.public()
+    rows=[]
+    for item in repository().list_accounts(claims["sub"]):
+        rows.append({**item,"external_account_id":item.get("account_id"),"base_currency":item.get("currency"),
+            "provider_type":"tradelocker","asset_classes":capabilities["asset_classes"],
+            "capabilities":capabilities,"is_primary":item.get("is_default_analysis",False)})
+    return {"accounts":rows}
+
+
+@router.put("/trading/accounts/{account_id}/primary")
+async def primary_trading_account(account_id:str,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_default_account(claims["sub"],account_id):raise HTTPException(status_code=404,detail="Account not found.")
+    return {"status":"primary","account_id":account_id}
+
+
+@router.put("/trading/accounts/{account_id}/nickname")
+async def nickname_trading_account(account_id:str,payload:AccountNicknameUpdate,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_account_nickname(claims["sub"],account_id,payload.nickname):raise HTTPException(status_code=404,detail="Account not found.")
+    return {"status":"updated","account_id":account_id,"nickname":payload.nickname}
+
+
+@router.put("/trading/accounts/{account_id}/enable")
+async def enable_trading_account(account_id:str,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_account_enabled(claims["sub"],account_id,True):raise HTTPException(status_code=404,detail="Account not found.")
+    return {"status":"enabled","account_id":account_id}
+
+
+@router.get("/trading/accounts/{account_id}/capabilities")
+async def trading_account_capabilities(account_id:str,claims:dict=Depends(current_claims))->dict:
+    account=next((item for item in repository().list_accounts(claims["sub"]) if item["public_id"]==account_id),None)
+    if not account:raise HTTPException(status_code=404,detail="Account not found.")
+    return {"account_id":account_id,"provider_type":"tradelocker",
+        "capabilities":provider_registry.require("tradelocker").capabilities.public()}
+
+
+@router.get("/user-preferences")
+async def user_preferences(claims:dict=Depends(current_claims))->dict:
+    return UserExperienceRepository().preferences(claims["sub"])
+
+
+@router.patch("/user-preferences")
+async def update_user_preferences(payload:UserPreferencesUpdate,claims:dict=Depends(current_claims))->dict:
+    return UserExperienceRepository().update_preferences(claims["sub"],payload.model_dump(exclude_none=True))
+
+
+@router.get("/watchlists")
+async def list_watchlists(claims:dict=Depends(current_claims))->dict:
+    return {"watchlists":UserExperienceRepository().list_watchlists(claims["sub"])}
+
+
+@router.post("/watchlists",status_code=201)
+async def create_watchlist(payload:WatchlistCreate,claims:dict=Depends(current_claims))->dict:
+    try:return UserExperienceRepository().create_watchlist(claims["sub"],payload.name,payload.symbols)
+    except Exception as exc:
+        if "UNIQUE" in str(exc):raise HTTPException(status_code=409,detail="A watchlist with this name already exists.") from None
+        raise
+
+
+@router.put("/watchlists/{watchlist_id}")
+async def update_watchlist(watchlist_id:str,payload:WatchlistUpdate,claims:dict=Depends(current_claims))->dict:
+    result=UserExperienceRepository().replace_watchlist(claims["sub"],watchlist_id,name=payload.name,items=payload.items)
+    if not result:raise HTTPException(status_code=404,detail="Watchlist not found.")
+    return result
+
+
+@router.delete("/watchlists/{watchlist_id}")
+async def delete_watchlist(watchlist_id:str,claims:dict=Depends(current_claims))->dict:
+    if not UserExperienceRepository().delete_watchlist(claims["sub"],watchlist_id):
+        raise HTTPException(status_code=409,detail="The default Forex Majors watchlist cannot be removed.")
+    return {"status":"deleted","watchlist_id":watchlist_id}
+
+
+async def _market_response(method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    service=MarketWorkspaceService()
+    try:return await getattr(service,method)(*args,**kwargs)
+    finally:await service.aclose()
+
+
+@router.get("/markets/search")
+async def market_search(q:str=Query(min_length=1,max_length=80),limit:int=Query(25,ge=1,le=50),
+                        claims:dict=Depends(current_claims))->dict:
+    return await _market_response("search",q,limit)
+
+
+@router.get("/markets/overview")
+async def market_overview(symbols:str|None=None,claims:dict=Depends(current_claims))->dict:
+    values=[value.strip() for value in (symbols or "").split(",") if value.strip()]
+    return await _market_response("overview",values or None)
+
+
+@router.get("/markets/news")
+async def market_news(category:str="general",limit:int=Query(20,ge=1,le=50),
+                      claims:dict=Depends(current_claims))->dict:
+    return await _market_response("news",category,limit)
+
+
+@router.get("/markets/calendar")
+async def market_calendar(start:date|None=None,end:date|None=None,limit:int=Query(50,ge=1,le=100),
+                          instrument:str|None=None,
+                          claims:dict=Depends(current_claims))->dict:
+    first=start or date.today();last=end or first+timedelta(days=14)
+    if last<first or (last-first).days>93:raise HTTPException(status_code=422,detail="Calendar range must be 0 to 93 days.")
+    try:return await _market_response("calendar",first,last,limit,instrument)
+    except InstrumentMappingError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
+
+
+@router.get("/markets/macro")
+async def market_macro(claims:dict=Depends(current_claims))->dict:
+    return await _market_response("macro")
+
+
+def _quote_number(payload:Any,names:set[str])->float|None:
+    if isinstance(payload,dict):
+        for key,value in payload.items():
+            if key.casefold() in names:
+                try:return float(value)
+                except (TypeError,ValueError):pass
+        for value in payload.values():
+            found=_quote_number(value,names)
+            if found is not None:return found
+    if isinstance(payload,list):
+        for value in payload:
+            found=_quote_number(value,names)
+            if found is not None:return found
+    return None
+
+
+async def _execution_market_context(user_sub:str,account_alias:str,canonical_id:str)->tuple[dict|None,dict|None]:
+    context,instruments=await _account_instruments(user_sub,account_alias)
+    canonical=instrument_mapper.resolve(canonical_id);candidates={canonical.symbol.casefold(),canonical.symbol.replace("/","").casefold()}
+    match=next((item for item in instruments if candidates.intersection({
+        str(item.get("symbol","")).casefold(),str(item.get("broker_symbol","")).casefold()})),None)
+    tradability={"account_alias":account_alias,"available":match is not None,
+        "currently_tradable":bool(match and match.get("tradeable",match.get("tradable",True))),
+        "environment":context.get("environment"),"source":"TradeLocker"}
+    if not match:return None,tradability
+    symbol=str(match.get("broker_symbol") or match.get("symbol") or canonical.symbol)
+    try:
+        async with TradeLockerClient(base_url=context["base_url"],username=context["username"],password=context["password"],
+            server=context["server"],account_id=context["account_id"],account_number=context["account_number"]) as client:
+            raw=await client.get_quote(symbol)
+        bid=_quote_number(raw,{"bid","bidprice"});ask=_quote_number(raw,{"ask","askprice"})
+        price=_quote_number(raw,{"price","last","lastprice","mid","close"})
+        if price is None and bid is not None and ask is not None:price=(bid+ask)/2
+        return ({"price":price,"bid":bid,"ask":ask,"timestamp":datetime.now(timezone.utc).isoformat(),
+                 "source":"TradeLocker"} if price is not None else None),tradability
+    except (TradeLockerError,HTTPException):return None,tradability
+
+
+@router.post("/trading/order-calculations")
+async def trading_order_calculations(payload:OrderCalculationRequest,claims:dict=Depends(current_claims))->dict:
+    """Read-only broker-authoritative ticket calculation; never creates a preview or submits an order."""
+    repo=repository();owned=next((item for item in repo.list_accounts(claims["sub"])
+        if item["public_id"]==payload.account_id or item["account_alias"].casefold()==payload.account_id.casefold()),None)
+    if not owned:raise HTTPException(status_code=404,detail="Trading account not found.")
+    context=repo.account_connection_context(claims["sub"],owned["account_alias"])
+    if not context:raise HTTPException(status_code=404,detail="Trading account not found.")
+    try:canonical=instrument_mapper.resolve(payload.instrument_id)
+    except InstrumentMappingError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
+    if canonical.asset_class!="forex":raise HTTPException(status_code=409,detail="Order calculations are currently supported for provider-identified forex instruments.")
+    requested=canonical.symbol.replace("/","").casefold()
+    try:
+        async with TradeLockerClient(base_url=context["base_url"],username=context["username"],password=context["password"],
+            server=context["server"],account_id=context["account_id"],account_number=context["account_number"]) as client:
+            symbols=await client.get_symbols();rows=TradeLockerClient._instrument_rows(symbols)
+            raw=next((row for row in rows if str(row.get("symbol") or row.get("name") or "").replace("/","").replace("_","").casefold()==requested),None)
+            if raw is None:raise HTTPException(status_code=409,detail="The selected account does not expose this instrument.")
+            normalized=normalize_instrument(raw)
+            if normalized is None:raise HTTPException(status_code=409,detail="Provider instrument metadata is unavailable.")
+            quote_raw=await client.get_quote(str(normalized["broker_symbol"]));bid=_quote_number(quote_raw,{"bid","bidprice","bp"});ask=_quote_number(quote_raw,{"ask","askprice","ap"})
+            quote_epoch=_quote_number(quote_raw,{"timestamp","time","updatedat","lastupdatetime"})
+            if quote_epoch and quote_epoch>10_000_000_000:quote_epoch/=1000
+            quote_timestamp=datetime.fromtimestamp(quote_epoch,timezone.utc) if quote_epoch else datetime.now(timezone.utc)
+            state=await client.get_account_state_payload()
+            equity=_quote_number(state,{"projectedbalance","equity","balance"})
+            account_currency=str(owned.get("currency") or "").upper() or None
+            quote_currency=str(normalized.get("quote_currency") or canonical.symbol[-3:]).upper()
+            rate=1.0 if account_currency==quote_currency else None
+            entry=ask if payload.side=="buy" else bid
+            base=canonical.symbol[:3].upper()
+            if rate is None and account_currency==base and entry:rate=1/entry
+            if rate is None and account_currency:
+                try:
+                    conversion=await client.get_quote(f"{quote_currency}{account_currency}")
+                    conversion_bid=_quote_number(conversion,{"bid","bidprice","bp"});conversion_ask=_quote_number(conversion,{"ask","askprice","ap"})
+                    if conversion_bid and conversion_ask:rate=(conversion_bid+conversion_ask)/2
+                except TradeLockerError:
+                    try:
+                        conversion=await client.get_quote(f"{account_currency}{quote_currency}")
+                        conversion_bid=_quote_number(conversion,{"bid","bidprice","bp"});conversion_ask=_quote_number(conversion,{"ask","askprice","ap"})
+                        if conversion_bid and conversion_ask:rate=2/(conversion_bid+conversion_ask)
+                    except TradeLockerError:pass
+    except HTTPException:raise
+    except TradeLockerError as exc:raise HTTPException(status_code=502,detail={"error":exc.code,"message":"Authoritative broker calculation data is unavailable."}) from None
+    metadata={"pip_size":_quote_number(raw,{"pipsize"}),"tick_size":normalized.get("tick_size"),
+        "price_precision":_quote_number(raw,{"priceprecision","digits","decimalplaces"}),
+        "contract_size":normalized.get("contract_size"),"quantity_step":normalized.get("quantity_increment"),
+        "minimum_quantity":normalized.get("minimum_quantity"),"maximum_quantity":normalized.get("maximum_quantity"),
+        "minimum_stop_distance":_quote_number(raw,{"minimumstopdistance","minstoplossdistance","stoplevel"}),
+        "leverage":_quote_number(raw,{"leverage","effectiveleverage"}),"margin_rate":normalized.get("margin"),
+        "quote_currency":quote_currency}
+    terms=forex_terms(canonical.symbol,metadata)
+    result=calculate_order(terms=terms,side=payload.side,quantity=payload.quantity.value,bid=bid,ask=ask,
+        quote_timestamp=quote_timestamp,quote_source="TradeLocker",stop_loss=payload.stop_loss.model_dump() if payload.stop_loss else None,
+        take_profit=payload.take_profit.model_dump() if payload.take_profit else None,account_currency=account_currency,
+        account_equity=equity,quote_to_account_rate=rate)
+    result["instrument"]={**canonical.model_dump(),"quantity_unit":terms.quantity_unit}
+    result["capabilities"]={"calculation":True,"preview":bool((owned.get("capabilities") or {}).get("order_preview")),
+        "submission":bool((owned.get("capabilities") or {}).get("order_submission"))}
+    return result
+
+
+@router.get("/markets/{canonical_id:path}/summary")
+async def market_summary(canonical_id:str,account_alias:str|None=None,claims:dict=Depends(current_claims))->dict:
+    try:
+        execution_quote=tradability=None
+        if account_alias:
+            try:execution_quote,tradability=await _execution_market_context(claims["sub"],account_alias,canonical_id)
+            except HTTPException:pass
+        return await _market_response("summary",canonical_id,execution_quote,tradability)
+    except InstrumentMappingError as exc:raise HTTPException(status_code=404,detail=str(exc)) from None
+
+
+@router.get("/markets/{symbol:path}")
+async def market_symbol(symbol:str,claims:dict=Depends(current_claims))->dict:
+    return await _market_response("symbol",symbol)
+
+
+@router.get("/accounts/{account_alias}/tradability/{symbol:path}")
+async def account_tradability(account_alias:str,symbol:str,claims:dict=Depends(current_claims))->dict:
+    context,instruments=await _account_instruments(claims["sub"],account_alias)
+    requested=symbol.casefold(); candidates={requested}
+    try:
+        canonical=instrument_mapper.resolve(symbol)
+        candidates.update({canonical.symbol.casefold(),canonical.symbol.replace("/","").casefold()})
+    except InstrumentMappingError:pass
+    match=next((item for item in instruments if candidates.intersection({
+        str(item.get("symbol","")).casefold(),str(item.get("broker_symbol","")).casefold(),
+        str(item.get("id","")).casefold(),str(item.get("instrument_id","")).casefold()})),None)
+    return {"account_alias":account_alias,"symbol":symbol,"available":match is not None,
+            "currently_tradable":bool(match and match.get("tradeable",match.get("tradable",True))),
+            "instrument":match,"environment":context.get("environment"),"source":"TradeLocker"}
 
 
 @router.get("/broker/status")
@@ -453,12 +804,29 @@ async def disable_account(account_id: str, claims: dict = Depends(current_claims
     return {"status": "disabled", "account_id": account_id}
 
 
+@router.put("/broker/accounts/{account_id}/enable")
+async def enable_account(account_id:str,claims:dict=Depends(current_claims))->dict:
+    if not repository().set_account_enabled(claims["sub"],account_id,True):
+        raise HTTPException(status_code=404,detail="Account not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return {"status":"enabled","account_id":account_id}
+
+
 @router.put("/broker/connections/{connection_id}/disable")
 async def disable_connection(connection_id: str, claims: dict = Depends(current_claims)) -> dict:
     if not repository().disable_connection(claims["sub"], connection_id):
         raise HTTPException(status_code=404, detail="Connection not found.")
     tradelocker_config_cache.invalidate_user(claims["sub"])
     return {"status": "disabled", "connection_id": connection_id}
+
+
+@router.delete("/broker/connections/{connection_id}")
+async def remove_connection(connection_id:str,claims:dict=Depends(current_claims))->dict:
+    try:removed=repository().remove_connection(claims["sub"],connection_id)
+    except BrokerStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
+    if not removed:raise HTTPException(status_code=404,detail="Trading connection not found.")
+    tradelocker_config_cache.invalidate_user(claims["sub"])
+    return {"status":"removed","connection_id":connection_id}
 
 
 @router.get("/execution-profiles")
@@ -614,7 +982,8 @@ async def patch_autonomous_controls(payload:AutonomousControlsUpdate,claims:dict
 
 @router.get("/autonomous-controls/audit")
 async def autonomous_control_audit(claims:dict=Depends(current_claims))->dict:
-    return {"events":ExecutionRepository().autonomous_control_audit(claims["sub"])}
+    events=ExecutionRepository().autonomous_control_audit(claims["sub"])
+    return {"events":[{**event,"occurred_at":event.get("changed_at")} for event in events]}
 
 
 @router.get("/execution-profiles/{profile_id}/autonomy/status")
@@ -623,10 +992,73 @@ async def autonomous_profile_status(profile_id:str,claims:dict=Depends(current_c
     except AutonomousExecutionError as exc:raise HTTPException(status_code=409,detail=exc.as_dict()) from None
 
 
+@router.post("/execution-profiles/{profile_id}/demo-test")
+async def run_profile_demo_test(profile_id:str,claims:dict=Depends(current_claims))->dict:
+    profile=repository().get_profile(claims["sub"],profile_id)
+    if not profile:raise HTTPException(status_code=404,detail="Strategy not found.")
+    if profile.get("account_environment")!="demo":
+        raise HTTPException(status_code=409,detail={"error":"demo_account_required",
+            "message":"Run Demo Test requires a verified demo trading account."})
+    try:
+        result=await AutonomousDecisionRunner().run(claims["sub"],profile_id,
+            f"demo-test:{profile_id}:{uuid.uuid4().hex[:16]}","demo_test",dry_run=True)
+        return {**result,"dry_run":True,"submission_allowed":False,
+            "message":"Analysis completed without submitting an order."}
+    except AutonomousExecutionError as exc:raise HTTPException(status_code=409,detail=exc.as_dict()) from None
+
+
 @router.get("/autonomous-runs")
 async def recent_autonomous_runs(claims:dict=Depends(current_claims))->dict:
     runner=AutonomousDecisionRunner()
     return {"runs":[runner._public_run(item) for item in runner.execution.recent_decision_runs(claims["sub"],20)]}
+
+
+@router.get("/activity")
+async def activity(account_alias:str|None=None,profile_id:str|None=None,event_type:str|None=None,
+                   outcome:str|None=None,date_from:date|None=None,date_to:date|None=None,
+                   claims:dict=Depends(current_claims))->dict:
+    execution=ExecutionRepository();repo=repository();profiles={item["public_id"]:item for item in repo.list_profiles(claims["sub"])}
+    events=[]
+    for record in execution.recent_decision_runs(claims["sub"],200):
+        public=AutonomousDecisionRunner._public_run(record);profile=profiles.get(str(record.get("profile_ref")),{})
+        events.append({"id":record.get("id"),"event_type":"strategy_evaluated","occurred_at":record.get("completed_at") or record.get("started_at"),
+            "account_alias":profile.get("account_alias"),"account_number":profile.get("account_number"),
+            "environment":profile.get("account_environment"),"profile_id":record.get("profile_ref"),"strategy_name":profile.get("name"),
+            "outcome":public["outcome"],"symbol":public.get("symbol"),"reason_codes":public.get("reason_codes",[]),
+            "confidence":(record.get("decision") or {}).get("confidence"),"dry_run":bool(record.get("shadow_mode")),"run_id":record.get("id")})
+    for record in execution.recent_executions(claims["sub"],100):
+        events.append({"id":record.get("id"),"event_type":"demo_order_submitted","occurred_at":record.get("created_at"),
+            "profile_id":record.get("profile_ref"),"outcome":str(record.get("state") or "submitted").upper(),
+            "symbol":record.get("symbol"),"environment":"demo"})
+    for record in execution.autonomous_control_audit(claims["sub"],100):
+        enabled=bool(record.get("new_value"));control=record.get("control_name")
+        kind=("kill_switch_enabled" if enabled else "kill_switch_disabled") if control=="global_autonomous_kill_switch" else "safety_control_updated"
+        events.append({"id":f"control-{record.get('id')}","event_type":kind,"occurred_at":record.get("changed_at"),
+            "outcome":"CONFIRMED","reason_codes":[record.get("reason")] if record.get("reason") else []})
+    def keep(item:dict[str,Any])->bool:
+        stamp=str(item.get("occurred_at") or "")[:10]
+        return (not account_alias or item.get("account_alias")==account_alias) and (not profile_id or item.get("profile_id")==profile_id) \
+            and (not event_type or item.get("event_type")==event_type) and (not outcome or item.get("outcome")==outcome) \
+            and (not date_from or stamp>=date_from.isoformat()) and (not date_to or stamp<=date_to.isoformat())
+    filtered=sorted((item for item in events if keep(item)),key=lambda item:str(item.get("occurred_at") or ""),reverse=True)
+    return {"events":filtered,"count":len(filtered),"generated_at":datetime.now(timezone.utc).isoformat()}
+
+
+@router.get("/status")
+async def user_status(claims:dict=Depends(current_claims))->dict:
+    repo=repository();connections=repo.list_connections(claims["sub"]);accounts=repo.list_accounts(claims["sub"])
+    worker=ScheduleRepository().worker_health();configured_finnhub=bool(settings.finnhub_enabled and settings.finnhub_api_key)
+    configured_fred=bool(settings.fred_enabled and settings.fred_api_key)
+    verified=[str(item.get("last_verified_at")) for item in accounts if item.get("last_verified_at")]
+    return {"services":[
+        {"id":"application_api","label":"Application API","status":"available"},
+        {"id":"broker","label":"HeroFX","status":"connected" if any(item.get("enabled") for item in connections) else "needs_attention"},
+        {"id":"platform","label":"TradeLocker integration","status":"connected" if any(item.get("enabled") for item in connections) else "unavailable"},
+        {"id":"market_data","label":"Market data","status":"available" if configured_finnhub else "unavailable"},
+        {"id":"news","label":"News","status":"available" if configured_finnhub else "unavailable"},
+        {"id":"macro","label":"Macro data","status":"available" if configured_fred else "unavailable"},
+        {"id":"automation","label":"Automation","status":"available" if worker["status"]=="healthy" else "needs_attention"}],
+        "last_successful_sync":max(verified) if verified else None,"generated_at":datetime.now(timezone.utc).isoformat()}
 
 
 @router.get("/autonomous-schedules")
@@ -637,7 +1069,8 @@ async def list_autonomous_schedules_api(claims:dict=Depends(current_claims))->di
 @router.post("/execution-profiles/{profile_id}/autonomy/schedule")
 async def save_autonomous_schedule(profile_id:str,payload:AutonomousScheduleRequest,claims:dict=Depends(current_claims))->dict:
     try:return AutonomousScheduleService().save(claims["sub"],profile_id,timezone_name=payload.timezone,
-        local_times=payload.local_times,enabled=payload.enabled,maximum_lateness_seconds=payload.maximum_lateness_seconds)
+        local_times=payload.local_times,recurrence=payload.recurrence,enabled=payload.enabled,
+        maximum_lateness_seconds=payload.maximum_lateness_seconds)
     except ScheduleStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
 
 
@@ -646,7 +1079,8 @@ async def edit_autonomous_schedule(schedule_id:str,payload:AutonomousScheduleReq
     repo=ScheduleRepository();existing=repo.get_schedule(claims["sub"],schedule_id)
     if not existing:raise HTTPException(status_code=404,detail="Schedule not found.")
     try:return AutonomousScheduleService(schedules=repo).save(claims["sub"],existing["profile_ref"],timezone_name=payload.timezone,
-        local_times=payload.local_times,enabled=payload.enabled,maximum_lateness_seconds=payload.maximum_lateness_seconds)
+        local_times=payload.local_times,recurrence=payload.recurrence,enabled=payload.enabled,
+        maximum_lateness_seconds=payload.maximum_lateness_seconds)
     except ScheduleStorageError as exc:raise HTTPException(status_code=409,detail=str(exc)) from None
 
 

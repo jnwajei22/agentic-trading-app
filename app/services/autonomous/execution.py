@@ -951,7 +951,7 @@ class AutonomousDemoService:
         )
         return {"schema_version": "1.0", "status": "approved", "preview_id": preview_id, "snapshot_id": proposal.snapshot_id, "pair": pair, "side": proposal.side, "order_type": proposal.order_type, "entry": proposal.entry, "stop_loss": proposal.stop_loss, "take_profit": proposal.take_profit, **size, "estimated_reward": estimated_reward, "reward_risk": calculation["reward_risk"], "calculation": calculation, "warnings": list(dict.fromkeys(warnings)), "expires_at": record["expires_at"], "violations": []}
 
-    async def submit(self, user_sub: str, preview_id: str, idempotency_key: str) -> dict[str, Any]:
+    async def submit(self, user_sub: str, preview_id: str, idempotency_key: str, *, before_dispatch=None) -> dict[str, Any]:
         preview = self.execution.get_preview(preview_id)
         if not preview or preview["user_sub"] != user_sub:
             raise AutonomousExecutionError("preview_not_found", "The approved preview is unavailable.", status="rejected")
@@ -1106,6 +1106,7 @@ class AutonomousDemoService:
                 try:
                     # The durable claim already exists. Never call place_order again for this preview/key.
                     response = await client.place_order(order_payload)
+                    if before_dispatch: before_dispatch()
                     dispatched = True
                 except TradeLockerError as exc:
                     ambiguous = (
@@ -1114,6 +1115,7 @@ class AutonomousDemoService:
                     )
                     if exc.operation != "place_order" or not ambiguous:
                         raise
+                    if before_dispatch: before_dispatch()
                     dispatched = True
                     ambiguous_submit_error = exc
                 reconciliation = await self._poll_reconciliation(
@@ -1447,7 +1449,7 @@ class AutonomousDemoService:
             "profile_ref":context.profile_ref,"account_alias":context.account_alias,"target":target,
             "expires_at":record["expires_at"],"submission_allowed":True,"blocking_reasons":[]}
 
-    async def submit_action(self,user_sub:str,preview_id:str,idempotency_key:str)->dict[str,Any]:
+    async def submit_action(self,user_sub:str,preview_id:str,idempotency_key:str,*,before_dispatch=None)->dict[str,Any]:
         preview=self.execution.get_action_preview(preview_id)
         if not preview or preview["user_sub"]!=user_sub: raise AutonomousExecutionError("preview_not_found","The action preview is unavailable.",status="rejected")
         if preview["status"]!="approved" or datetime.fromisoformat(preview["expires_at"])<=utcnow():
@@ -1469,6 +1471,7 @@ class AutonomousDemoService:
             aliases=("orderId","id") if preview["action_type"]=="cancel_order" else ("positionId","id")
             if not any(str(_find_value(row,aliases))==preview["target_id"] for row in rows):
                 raise AutonomousExecutionError("target_not_found","The broker target no longer exists.",status="rejected")
+            if before_dispatch: before_dispatch()
             response=await (client.cancel_order(preview["target_id"]) if preview["action_type"]=="cancel_order" else client.close_position(preview["target_id"],strategy_id=f"afd-{preview_id[-20:]}"));dispatched=True
             after=await (client.get_orders() if preview["action_type"]=="cancel_order" else client.get_open_positions())
             after_rows=map_configured_rows(config_response=config,data_response=after,

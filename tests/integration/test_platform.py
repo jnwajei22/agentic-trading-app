@@ -10,7 +10,7 @@ from app.brokers.tradelocker import adapter
 from app.brokers.tradelocker.client import TradeLockerError
 from app.config.settings import settings
 from app.main import app
-from app.mcp import tools
+from app.services import desk_tools as tools
 from app.storage.brokers import BrokerRepository
 from app.services.tradelocker.config_cache import (
     TradeLockerConfigCacheKey,
@@ -50,6 +50,71 @@ def _client_for(subject: str) -> TestClient:
     return TestClient(app)
 
 
+def test_order_calculation_is_owned_read_only_and_never_submits(platform_storage,monkeypatch):
+    user="auth0|calculator";connection=platform_storage.save_connection(user,base_url="https://demo.example/backend-api",
+        username="user",password="password",server="HeroFX",environment="demo")
+    platform_storage.sync_accounts(user,connection.connection_ref,
+        {"accounts":[{"accountId":"external-1","accNum":"123","currency":"USD"}]})
+    account=platform_storage.list_accounts(user)[0]
+    class Client:
+        submitted=False
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def get_symbols(self):return [{"tradableInstrumentId":"1","symbol":"GBPUSD","assetClass":"forex",
+            "tickSize":.00001,"contractSize":100000,"minQty":.01,"qtyStep":.01,"marginRate":.02}]
+        async def get_quote(self,symbol):return {"d":{"bp":1.3452,"ap":1.34528}}
+        async def get_account_state_payload(self):return {"d":{"balance":100000}}
+        async def submit_order(self,*args,**kwargs):Client.submitted=True;raise AssertionError("calculation cannot submit")
+        _instrument_rows=staticmethod(lambda payload:payload)
+    monkeypatch.setattr(platform,"TradeLockerClient",Client)
+    request={"account_id":account["public_id"],"instrument_id":"forex:GBP/USD","side":"buy","order_type":"market",
+        "quantity":{"value":.5,"unit":"lot"},"stop_loss":{"mode":"pips","value":40},
+        "take_profit":{"mode":"reward_multiple","value":2}}
+    with _client_for(user) as client:
+        response=client.post("/api/trading/order-calculations",json=request)
+    assert response.status_code==200
+    result=response.json();assert result["entry_side"]=="Ask" and result["pip_value"]["value"]==5
+    assert result["stop_loss"]["distance_pips"]==40 and result["take_profit"]["reward_to_risk"]==2
+    assert Client.submitted is False and "preview_id" not in result
+
+    with _client_for("auth0|other-user") as client:
+        forbidden=client.post("/api/trading/order-calculations",json=request)
+    assert forbidden.status_code==404
+
+
+def test_order_calculation_rejects_unknown_account_without_broker_access(platform_storage,monkeypatch):
+    class ForbiddenClient:
+        def __init__(self,**kwargs):raise AssertionError("broker must not be called")
+    monkeypatch.setattr(platform,"TradeLockerClient",ForbiddenClient)
+    with _client_for("auth0|nobody") as client:
+        response=client.post("/api/trading/order-calculations",json={"account_id":"unknown","instrument_id":"forex:EUR/USD",
+            "side":"sell","quantity":{"value":1,"unit":"lot"}})
+    assert response.status_code==404
+
+
+def test_generic_provider_routes_project_legacy_tradelocker_records(platform_storage):
+    connection = platform_storage.save_connection("auth0|generic", base_url="https://demo.example/backend-api",
+        username="user", password="password", server="HeroFX", environment="demo")
+    platform_storage.sync_accounts("auth0|generic", connection.connection_ref,
+        {"accounts":[{"accountId":"external-1","accNum":"12345678","currency":"USD"}]})
+    account = platform_storage.list_accounts("auth0|generic")[0]
+    with _client_for("auth0|generic") as client:
+        providers = client.get("/api/providers").json()["providers"]
+        assert next(item for item in providers if item["provider_type"]=="tradingview_chart")["execution_provider"] is False
+        generic_connection = client.get("/api/trading/connections").json()["connections"][0]
+        generic_account = client.get("/api/trading/accounts").json()["accounts"][0]
+        legacy_connection = client.get("/api/broker/connections").json()["connections"][0]
+        legacy_account = client.get("/api/broker/accounts").json()["accounts"][0]
+        assert generic_connection["public_id"] == legacy_connection["public_id"]
+        assert generic_connection["broker_name"] != generic_connection["platform_name"]
+        assert generic_account["public_id"] == legacy_account["public_id"] == account["public_id"]
+        assert generic_account["capabilities"]["order_submission"] is True
+        public_payload = str({"providers":providers,"connection":generic_connection,"account":generic_account}).lower()
+        assert "password" not in public_payload and "api_key" not in public_payload and "ciphertext" not in public_payload
+        assert client.put(f"/api/trading/accounts/{account['public_id']}/primary").status_code == 200
+
+
 def test_autonomous_controls_api_is_durable_audited_and_requires_live_confirmation(platform_storage, monkeypatch):
     monkeypatch.setattr(settings, "kill_switch_enabled", False)
     with _client_for("auth0|controls-a") as client:
@@ -72,6 +137,37 @@ def test_autonomous_controls_api_is_durable_audited_and_requires_live_confirmati
         assert isolated["demo_autonomous_enabled"] is False
         assert isolated["live_autonomous_enabled"] is False
 
+
+def test_preferences_watchlists_and_safe_status_are_user_scoped(platform_storage):
+    with _client_for("auth0|ux-a") as client:
+        preferences=client.patch("/api/user-preferences",json={"timezone":"Europe/London",
+            "notifications":{"schedule_failed":False}})
+        assert preferences.status_code==200 and preferences.json()["timezone"]=="Europe/London"
+        initial=client.get("/api/watchlists").json()["watchlists"]
+        assert initial[0]["name"]=="Forex Majors"
+        custom=client.post("/api/watchlists",json={"name":"Metals","symbols":["OANDA:XAU_USD"]})
+        assert custom.status_code==201 and custom.json()["items"][0]["symbol"]=="OANDA:XAU_USD"
+        status=client.get("/api/status")
+        assert status.status_code==200 and all("worker_id" not in str(item) for item in status.json()["services"])
+    with _client_for("auth0|ux-b") as client:
+        assert client.get("/api/user-preferences").json()["timezone"]=="America/Chicago"
+        assert all(item["name"]!="Metals" for item in client.get("/api/watchlists").json()["watchlists"])
+
+
+def test_demo_test_endpoint_is_explicitly_non_submitting(platform_storage,monkeypatch):
+    user="auth0|dry-run";connection=platform_storage.save_connection(user,base_url="https://demo.test/backend-api",
+        username="user",password="password",server="HeroFX",environment="demo")
+    platform_storage.sync_accounts(user,connection.connection_ref,{"accounts":[{"accountId":"1","accNum":"12345678","currency":"USD"}]})
+    account=platform_storage.list_accounts(user)[0]
+    profile=platform_storage.create_profile(user,name="Demo Strategy",account_ref=account["public_id"])
+    class FakeRunner:
+        async def run(self,*args,**kwargs):
+            assert kwargs["dry_run"] is True
+            return {"status":"no_trade","outcome":"NO_TRADE","run_id":"dry","reason_codes":["dry_run_trade_candidate"]}
+    monkeypatch.setattr(platform,"AutonomousDecisionRunner",lambda:FakeRunner())
+    with _client_for(user) as client:
+        result=client.post(f"/api/execution-profiles/{profile['public_id']}/demo-test")
+    assert result.status_code==200 and result.json()["submission_allowed"] is False and result.json()["dry_run"] is True
 
 def test_profile_decision_engine_update_persists_and_reports_safe_readiness(platform_storage, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", None)
@@ -287,6 +383,11 @@ def test_saved_credentials_discover_accounts_without_returning_secrets(
     password = "private-password"
     token = "private-jwt-token"
     captured = {}
+    discovered_accounts = [
+        {"accountId": 12345, "accNum": 2, "name": "First", "currency": "USD"},
+        {"accountId": 12346, "accNum": 3, "name": "Second", "currency": "EUR"},
+        {"accountId": 12347, "accNum": 4, "name": "Third", "currency": "GBP"},
+    ]
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -299,7 +400,7 @@ def test_saved_credentials_discover_accounts_without_returning_secrets(
             return None
 
         async def get_accounts(self):
-            return {"accounts": [{"accountId": 12345, "accNum": 2}]}
+            return {"accounts": discovered_accounts}
 
     monkeypatch.setattr(platform, "TradeLockerClient", FakeClient)
     with _client_for("auth0|user-a") as client:
@@ -315,7 +416,10 @@ def test_saved_credentials_discover_accounts_without_returning_secrets(
         discovered = client.post("/api/broker/tradelocker/discover-accounts")
 
     assert saved.json()["status"] == "connected_no_account"
-    assert discovered.json() == {"accounts": [{"accountId": 12345, "accNum": 2}]}
+    assert discovered.json() == {"accounts": discovered_accounts}
+    stored_accounts = platform_storage.list_accounts("auth0|user-a")
+    assert len(stored_accounts) == 3
+    assert not any(account["is_default_analysis"] for account in stored_accounts)
     assert captured["password"] == password
     output = saved.text + discovered.text
     assert password not in output
@@ -579,7 +683,6 @@ def test_cors_allows_configured_frontend_origin():
 @pytest.mark.asyncio
 async def test_mcp_missing_connection_returns_safe_setup_url(platform_storage, monkeypatch):
     monkeypatch.setattr(settings, "frontend_origin", "https://setup.example.test/")
-    monkeypatch.setattr(settings, "chatgpt_return_url", "https://chatgpt.com")
     identity_token = set_current_claims(_claims("auth0|not-connected"))
     try:
         result = await tools.get_my_tradelocker_symbols()
@@ -588,8 +691,7 @@ async def test_mcp_missing_connection_returns_safe_setup_url(platform_storage, m
         reset_current_claims(identity_token)
 
     expected_url = (
-        "https://setup.example.test/connect-tradelocker?source=chatgpt"
-        "&returnTo=https%3A%2F%2Fchatgpt.com"
+        "https://setup.example.test/connect-tradelocker"
     )
     assert result == {
         "status": "setup_required",
@@ -597,7 +699,7 @@ async def test_mcp_missing_connection_returns_safe_setup_url(platform_storage, m
         "setup_url": expected_url,
         "instruction": (
             "Open the setup URL, connect TradeLocker using the same login account, "
-            "then return to ChatGPT and run this again."
+            "then retry in the desk assistant."
         ),
     }
     assert status["setup_url"] == expected_url

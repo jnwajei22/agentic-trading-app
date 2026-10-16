@@ -55,11 +55,9 @@ Run exactly one SQLite scheduler worker. Set `AUTONOMOUS_SCHEDULER_EMBEDDED=fals
 - `GET /ready`: API readiness plus scheduler state; returns 503 when scheduler readiness is required and stale.
 - `GET /scheduler/health`: non-secret worker counts.
 - Dashboard: worker heartbeat, local/UTC next and last runs, pause/resume/delete, disarm, kill-switch enable, and recent outcomes.
-- MCP: `list_autonomous_schedules`, `get_autonomous_schedule_status`, `list_recent_autonomous_runs`, and `get_autonomous_daily_summary` are read-only.
 
 Logs go to the process supervisor's stdout/stderr capture (or the configured application log collector). Structured messages cover heartbeat polls, claims, reclaim after lease expiry, misfires, lock contention, duplicate suppression, retry count, provider latency, outcome, and safe profile references. Credentials and connection payloads are never logged.
 
-ChatGPT Scheduled Tasks are optional. They should call only `run_autonomous_demo_profile` with a unique run key; they must not call preview/submit tools individually. Backend scheduling is the primary unattended path.
 
 ## Retry and restart behavior
 
